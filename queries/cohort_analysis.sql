@@ -99,27 +99,19 @@ retention AS (
     SELECT
         cohort_month,
         COUNT(DISTINCT CASE 
-            WHEN days_since_first <= INTERVAL '30 days' 
-            AND days_since_first > INTERVAL '0 days'
+            WHEN order_date > first_order_date
+             AND order_date <= first_order_date + INTERVAL '30 days'
             THEN customer_id END) AS retained_30,
+
         COUNT(DISTINCT CASE 
-            WHEN days_since_first <= INTERVAL '60 days'
-            AND days_since_first > INTERVAL '0 days'
+            WHEN order_date > first_order_date
+             AND order_date <= first_order_date + INTERVAL '60 days'
             THEN customer_id END) AS retained_60,
+
         COUNT(DISTINCT CASE 
-            WHEN days_since_first <= INTERVAL '90 days'
-            AND days_since_first > INTERVAL '0 days'
+            WHEN order_date > first_order_date
+             AND order_date <= first_order_date + INTERVAL '90 days'
             THEN customer_id END) AS retained_90
     FROM all_orders
     GROUP BY cohort_month
 )
-SELECT
-    c.cohort_month,
-    c.total_customers,
-    r.retained_30 * 1.0 / c.total_customers AS retention_30,
-    r.retained_60 * 1.0 / c.total_customers AS retention_60,
-    r.retained_90 * 1.0 / c.total_customers AS retention_90
-FROM cohort_size c
-JOIN retention r
-    ON c.cohort_month = r.cohort_month
-ORDER BY c.cohort_month;

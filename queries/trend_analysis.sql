@@ -1,6 +1,10 @@
+-- ============================================================
+-- Trend Analysis 1: Daily Metrics
+-- ============================================================
+
 WITH daily_metrics AS (
     SELECT
-        DATE(order_date) AS day,
+        DATE(o.order_date) AS day,
         COUNT(DISTINCT o.order_id) AS order_count,
         SUM(oi.quantity * oi.unit_price) AS revenue
     FROM orders o
@@ -8,13 +12,21 @@ WITH daily_metrics AS (
         ON o.order_id = oi.order_id
     GROUP BY day
 )
-SELECT * FROM daily_metrics
+
+SELECT *
+FROM daily_metrics
 ORDER BY day;
 
 
+
+-- ============================================================
+-- Trend Analysis 2: Moving Averages (7-day, 30-day)
+-- (ROWS BETWEEN)
+-- ============================================================
+
 WITH daily_metrics AS (
     SELECT
-        DATE(order_date) AS day,
+        DATE(o.order_date) AS day,
         COUNT(DISTINCT o.order_id) AS order_count,
         SUM(oi.quantity * oi.unit_price) AS revenue
     FROM orders o
@@ -22,6 +34,7 @@ WITH daily_metrics AS (
         ON o.order_id = oi.order_id
     GROUP BY day
 )
+
 SELECT
     day,
     order_count,
