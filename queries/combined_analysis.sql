@@ -1,138 +1,177 @@
-WITH customer_orders AS (
+-- combined_analysis.sql
+-- Multi-window queries that combine analytical lenses no single window function can provide alone.
+
+-- ============================================================
+-- Query 1: Cohort retention rates with period-over-period change
+--           ROW_NUMBER (cohort definition) + LAG (retention trend)
+-- ============================================================
+WITH first_purchases AS (
     SELECT
         o.customer_id,
-        o.order_date,
-        ROW_NUMBER() OVER (
-            PARTITION BY o.customer_id
-            ORDER BY o.order_date
-        ) AS rn
+        MIN(o.order_date)                          AS first_purchase_date,
+        DATE_TRUNC('month', MIN(o.order_date))     AS cohort_month
     FROM orders o
+    WHERE o.status != 'cancelled'
+    GROUP BY o.customer_id
 ),
 
-first_orders AS (
+cohort_members AS (
     SELECT
         customer_id,
-        order_date AS first_order_date,
-        DATE_TRUNC('month', order_date) AS cohort_month
-    FROM customer_orders
-    WHERE rn = 1
-),
-
-all_orders AS (
-    SELECT
-        o.customer_id,
-        o.order_date,
-        f.first_order_date,
-        f.cohort_month
-    FROM orders o
-    JOIN first_orders f
-        ON o.customer_id = f.customer_id
-),
-
-retention AS (
-    SELECT
+        first_purchase_date,
         cohort_month,
-        COUNT(DISTINCT CASE 
-            WHEN order_date > first_order_date
-             AND order_date <= first_order_date + INTERVAL '30 days'
-            THEN customer_id END
-        ) AS retained_30
-    FROM all_orders
+        ROW_NUMBER() OVER (PARTITION BY cohort_month ORDER BY first_purchase_date, customer_id) AS member_rank
+    FROM first_purchases
+),
+
+cohort_sizes AS (
+    SELECT cohort_month, COUNT(*) AS cohort_size
+    FROM cohort_members
     GROUP BY cohort_month
 ),
 
-cohort_size AS (
+repeat_90d AS (
     SELECT
-        cohort_month,
-        COUNT(DISTINCT customer_id) AS total_customers
-    FROM first_orders
-    GROUP BY cohort_month
+        fp.cohort_month,
+        COUNT(DISTINCT o.customer_id) AS retained_90d
+    FROM first_purchases fp
+    JOIN orders o
+        ON  o.customer_id = fp.customer_id
+        AND o.order_date   > fp.first_purchase_date
+        AND o.order_date  <= fp.first_purchase_date + INTERVAL '90 days'
+        AND o.status      != 'cancelled'
+    GROUP BY fp.cohort_month
 ),
 
-final AS (
+cohort_retention AS (
     SELECT
-        r.cohort_month,
-        r.retained_30 * 1.0 / c.total_customers AS retention_rate
-    FROM retention r
-    JOIN cohort_size c
-        ON r.cohort_month = c.cohort_month
+        cs.cohort_month,
+        cs.cohort_size,
+        COALESCE(r.retained_90d, 0) AS retained_90d,
+        ROUND(100.0 * COALESCE(r.retained_90d, 0) / NULLIF(cs.cohort_size, 0), 2) AS retention_rate_90d
+    FROM cohort_sizes cs
+    LEFT JOIN repeat_90d r USING (cohort_month)
 )
 
 SELECT
     cohort_month,
-    retention_rate,
-
-    LAG(retention_rate) OVER (ORDER BY cohort_month) AS prev_retention,
-
-    retention_rate 
-    - LAG(retention_rate) OVER (ORDER BY cohort_month) AS retention_change
-
-FROM final
+    cohort_size,
+    retained_90d,
+    retention_rate_90d,
+    -- Period-over-period change in retention rate (LAG)
+    LAG(retention_rate_90d) OVER (ORDER BY cohort_month)  AS prev_cohort_retention_rate,
+    ROUND(
+        retention_rate_90d
+        - LAG(retention_rate_90d) OVER (ORDER BY cohort_month)
+    , 2)                                                   AS retention_rate_mom_change_ppts,
+    -- Running average retention across all cohorts so far
+    ROUND(
+        AVG(retention_rate_90d) OVER (
+            ORDER BY cohort_month
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ), 2
+    )                                                      AS running_avg_retention_rate,
+    -- Rank cohorts by retention (best = 1)
+    RANK() OVER (ORDER BY retention_rate_90d DESC)         AS retention_rank
+FROM cohort_retention
 ORDER BY cohort_month;
 
 
-
 -- ============================================================
--- Combined Analysis 2: Monthly Revenue + Running Total + Growth
--- (SUM window + LAG)
+-- Query 2: Category revenue share with 30-day moving average trend
+--           Partitioned SUM (share %) + ROWS BETWEEN frame (MA trend)
 -- ============================================================
-
-WITH monthly_revenue AS (
+WITH daily_category_revenue AS (
     SELECT
-        DATE_TRUNC('month', o.order_date) AS month,
-        SUM(oi.quantity * oi.unit_price) AS revenue
-    FROM orders o
-    JOIN order_items oi
-        ON o.order_id = oi.order_id
-    GROUP BY month
-)
-
-SELECT
-    month,
-    revenue,
-
-    SUM(revenue) OVER (
-        ORDER BY month
-    ) AS running_total,
-
-    LAG(revenue) OVER (
-        ORDER BY month
-    ) AS prev_revenue,
-
-    (revenue - LAG(revenue) OVER (ORDER BY month)) * 1.0
-        / LAG(revenue) OVER (ORDER BY month) AS growth_rate
-
-FROM monthly_revenue
-ORDER BY month;
-
-
-
--- ============================================================
--- Combined Analysis 3: Category Revenue Share
--- (Window SUM + Partitioning)
--- ============================================================
-
-WITH category_monthly AS (
-    SELECT
+        o.order_date::DATE                                      AS day,
         p.category,
-        DATE_TRUNC('month', o.order_date) AS month,
-        SUM(oi.quantity * oi.unit_price) AS revenue
+        ROUND(SUM(oi.quantity * oi.unit_price)::NUMERIC, 2)    AS category_revenue
     FROM orders o
-    JOIN order_items oi ON o.order_id = oi.order_id
-    JOIN products p ON oi.product_id = p.product_id
-    GROUP BY p.category, month
+    JOIN order_items oi USING (order_id)
+    JOIN products p     ON oi.product_id = p.product_id
+    WHERE o.status != 'cancelled'
+    GROUP BY o.order_date::DATE, p.category
 )
 
 SELECT
+    day,
     category,
+    category_revenue,
+
+    -- Daily revenue share for this category (% of all categories that day)
+    ROUND(
+        100.0 * category_revenue
+        / NULLIF(SUM(category_revenue) OVER (PARTITION BY day), 0)
+    , 2) AS daily_category_share_pct,
+
+    -- 30-day moving average revenue for this category
+    ROUND(
+        AVG(category_revenue) OVER (
+            PARTITION BY category
+            ORDER BY day
+            ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+        )::NUMERIC, 2
+    ) AS category_revenue_30d_ma,
+
+    -- Running total revenue for this category
+    SUM(category_revenue) OVER (
+        PARTITION BY category
+        ORDER BY day
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS category_cumulative_revenue,
+
+    -- Rank categories by revenue on each given day
+    RANK() OVER (PARTITION BY day ORDER BY category_revenue DESC) AS daily_category_rank
+FROM daily_category_revenue
+ORDER BY day, category;
+
+
+-- ============================================================
+-- Query 3: Monthly revenue by customer segment with growth rate
+--           and running total (LAG + SUM window)
+-- ============================================================
+WITH monthly_segment_revenue AS (
+    SELECT
+        DATE_TRUNC('month', o.order_date)                      AS month,
+        c.segment,
+        COUNT(DISTINCT o.order_id)                             AS order_count,
+        COUNT(DISTINCT o.customer_id)                          AS active_customers,
+        ROUND(SUM(oi.quantity * oi.unit_price)::NUMERIC, 2)   AS revenue
+    FROM orders o
+    JOIN order_items oi  USING (order_id)
+    JOIN customers c     ON o.customer_id = c.customer_id
+    WHERE o.status != 'cancelled'
+    GROUP BY DATE_TRUNC('month', o.order_date), c.segment
+)
+
+SELECT
     month,
+    segment,
     revenue,
+    order_count,
+    active_customers,
 
-    SUM(revenue) OVER (PARTITION BY category) AS category_total,
+    -- Month-over-month revenue growth within each segment (LAG)
+    LAG(revenue) OVER (PARTITION BY segment ORDER BY month)            AS prev_month_revenue,
+    ROUND(
+        100.0 * (revenue - LAG(revenue) OVER (PARTITION BY segment ORDER BY month))
+        / NULLIF(LAG(revenue) OVER (PARTITION BY segment ORDER BY month), 0)
+    , 2)                                                                AS mom_revenue_growth_pct,
 
-    SUM(revenue) OVER () AS overall_total,
+    -- Running cumulative revenue per segment
+    SUM(revenue) OVER (
+        PARTITION BY segment
+        ORDER BY month
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    )                                                                   AS segment_cumulative_revenue,
 
-    revenue * 1.0 / SUM(revenue) OVER () AS revenue_share
+    -- Segment revenue share of total revenue each month
+    ROUND(
+        100.0 * revenue
+        / NULLIF(SUM(revenue) OVER (PARTITION BY month), 0)
+    , 2)                                                                AS segment_monthly_share_pct,
 
-FROM category_monthly
-ORDER BY category, month;
+    -- Rank segments within each month by revenue
+    RANK() OVER (PARTITION BY month ORDER BY revenue DESC)             AS segment_rank_in_month
+FROM monthly_segment_revenue
+ORDER BY month, segment;
